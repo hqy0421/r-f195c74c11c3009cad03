@@ -1,6 +1,7 @@
 <form action="." id="query-form" method="post" role="form">
   <input name="ordering" type="hidden" value="" />
   <input name="export_ordering" type="hidden" value="{% if ordering %}{{ ordering }}{% endif %}" />
+  <input name="table" type="hidden" value="{{ table or '' }}" />
   <div class="form-group{% if error %} has-error has-feedback{% endif %}">
     <textarea class="form-control remember-size{% if error %} is-invalid{% endif %}" id="{{ sql_textarea_id }}" name="sql" style="height: 120px;">{% if sql %}{{ sql }}{% else %}{{ default_sql }}{% endif %}</textarea>
     <small class="form-text text-muted">Ctrl+Enter runs the query. Shift+Up/Down cycles recent queries.</small>
@@ -14,6 +15,7 @@
     <button class="btn btn-sm btn-outline-secondary" name="export_json" type="submit">JSON</button>
     <button class="btn btn-sm btn-outline-secondary" name="export_csv" type="submit">CSV</button>
     <button class="btn btn-sm btn-outline-secondary" name="explain" type="submit" value="1" title="Show the query plan without running the statement">Explain</button>
+    <button class="btn btn-sm btn-outline-secondary" name="capture" type="submit" value="1" formaction="{{ url_for('capture_start') }}" title="Run this SELECT in the background and keep the complete result for browsing and export, unaffected by later edits">Capture</button>
   </div>
   <div class="btn-group ml-2">
     <div class="dropdown">

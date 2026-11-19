@@ -1,0 +1,77 @@
+{% extends "base_tables.html" %}
+
+{% block extra_scripts %}
+  {% if capture.status == 'running' %}
+    <script type="text/javascript">
+      $(function() {
+        var timer = setInterval(function() {
+          $.getJSON({{ url_for('capture_status', task_id=capture.id)|tojson }}, function(data) {
+            $('#capture-rows').text(data.row_count);
+            if (data.status !== 'running') {
+              clearInterval(timer);
+              window.location.reload();
+            }
+          }).fail(function(xhr) {
+            if (xhr.status === 404) {
+              /* The capture went away (deleted, or its database unloaded). */
+              clearInterval(timer);
+              window.location.reload();
+            }
+          });
+        }, 1000);
+      });
+    </script>
+  {% endif %}
+{% endblock %}
+
+{% block content_title %}Query capture{% endblock %}
+
+{% block content %}
+  <p class="mb-1"><a href="{{ url_for('generic_query') }}">&laquo; Query</a></p>
+  <h3>Query capture</h3>
+  <p>
+    Database: <strong>{{ capture.dataset_name }}</strong>
+    <small class="text-muted">{{ capture.dataset_key }}</small>
+  </p>
+  {{ capture.sql|highlight }}
+
+  {% if capture.status == 'running' %}
+    <div class="alert alert-info">
+      Capture is running&hellip; <strong><span id="capture-rows">{{ capture.row_count }}</span></strong> row(s) captured so far.
+    </div>
+  {% elif capture.status == 'done' %}
+    <div class="alert alert-success">
+      Capture complete: <strong>{{ capture.row_count }}</strong> row(s). This result is frozen &mdash; later edits to the source tables do not affect it.
+    </div>
+    <p>
+      Export:
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('capture_export', task_id=capture.id, fmt='csv') }}">CSV</a>
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('capture_export', task_id=capture.id, fmt='json') }}">JSON</a>
+    </p>
+  {% elif capture.status == 'error' %}
+    <div class="alert alert-danger">Capture failed: <code>{{ capture.error }}</code></div>
+  {% else %}
+    <div class="alert alert-warning">Capture was cancelled; the partial result was discarded.</div>
+  {% endif %}
+
+  <div class="mb-3">
+    {% if capture.status == 'running' %}
+      <form class="d-inline" action="{{ url_for('capture_cancel', task_id=capture.id) }}" method="post">
+        <button class="btn btn-sm btn-warning" type="submit">Cancel capture</button>
+      </form>
+    {% endif %}
+    <form class="d-inline" action="{{ url_for('capture_delete', task_id=capture.id) }}" method="post">
+      <button class="btn btn-sm btn-danger" type="submit">Delete result</button>
+    </form>
+  </div>
+
+  {% if result %}
+    {% if result.rows %}
+      <h4>Rows ({{ page_start }}&ndash;{{ page_start + result.rows|length - 1 }} of {{ capture.row_count }})</h4>
+    {% endif %}
+    {% include "results.html" %}
+    {% if result.rows %}
+      {% include "pagination.html" %}
+    {% endif %}
+  {% endif %}
+{% endblock %}

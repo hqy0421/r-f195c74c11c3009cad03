@@ -22,7 +22,12 @@
               {{ col }}
             {% else %}
               {% set target = (-loop.index if loop.index == ordering else loop.index) %}
-              <a href="{{ url_for(request.endpoint, table=table, sql=sql, ordering=target) }}">{{ col }}{% if ordering %}{% if loop.index == ordering %}&#9660;{% elif loop.index == -ordering %}&#9650;{% endif %}{% endif %}</a>
+              {% if capture %}
+                {% set col_url = url_for('capture_view', task_id=capture.id, ordering=target) %}
+              {% else %}
+                {% set col_url = url_for(request.endpoint, table=table, sql=sql, ordering=target) %}
+              {% endif %}
+              <a href="{{ col_url }}">{{ col }}{% if ordering %}{% if loop.index == ordering %}&#9660;{% elif loop.index == -ordering %}&#9650;{% endif %}{% endif %}</a>
             {% endif %}
           </th>
         {% endfor %}

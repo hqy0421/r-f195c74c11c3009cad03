@@ -2,6 +2,7 @@
 
 __version__ = '0.8.2'
 
+import atexit
 import base64
 import datetime
 import decimal
@@ -84,6 +85,17 @@ except ImportError:
     from executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
+
+try:
+    from sqlite_web.capture import (
+        CaptureIncomplete, CaptureTask, ExportStreamer, close_all_tasks,
+        close_tasks_for_dataset, get_task, register_task, remove_task,
+        tasks_for_dataset)
+except ImportError:
+    from capture import (
+        CaptureIncomplete, CaptureTask, ExportStreamer, close_all_tasks,
+        close_tasks_for_dataset, get_task, register_task, remove_task,
+        tasks_for_dataset)
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -487,6 +499,9 @@ def unload():
             ds = datasets.pop(dataset)
             remaining = list(datasets)[0]
         ds.close()
+        # Captures belong to the unloaded database: cancel them and
+        # release their connections and stored results.
+        close_tasks_for_dataset(dataset)
 
         current = session.get('dataset')
         if current == dataset:
@@ -606,6 +621,7 @@ def _query_view(template, table=None):
         allow_bulk=allow_bulk,
         allow_detail=allow_detail,
         allow_edit=allow_edit,
+        captures=tasks_for_dataset(dataset.filename),
         default_sql=default_sql,
         error=error,
         fk_lookup=fk_lookup,
@@ -1306,6 +1322,145 @@ def table_query(table):
             return redirect(url_for('generic_query', sql=request.values['sql']))
         abort(404)
     return _query_view('table_query.html', table)
+
+#
+# Query-result captures.
+#
+
+def _new_task_database(dataset):
+    # A capture runs on its own connection, opened with the same settings
+    # as the dataset's own connections. The task thread connects it.
+    src = dataset._database
+    db = SqliteDatabase(src.database, **src.connect_params)
+    if dataset_config.get('foreign_keys'):
+        db.pragma('foreign_keys', True, permanent=True)
+    for ext in dataset_config.get('extensions') or []:
+        db.load_extension(ext)
+    return db
+
+@app.route('/capture/', methods=['POST'])
+def capture_start():
+    dataset = get_dataset()
+    sql = request.form.get('sql') or ''
+    table = request.form.get('table') or None
+
+    statements = split_statements(sql) if sql.strip() else []
+    if len(statements) != 1 or not is_read(dataset, sql):
+        flash('Only a single read query may be captured.', 'warning')
+        if table and table in dataset.cached_tables():
+            return redirect(url_for('table_query', table=table, sql=sql))
+        return redirect(url_for('generic_query', sql=sql))
+
+    task = CaptureTask(
+        dataset.filename,
+        dataset.basename,
+        sql,
+        _new_task_database(dataset),
+        startup_hook=dataset_config.get('startup_hook'))
+    register_task(task)
+    task.start()
+    return redirect(url_for('capture_view', task_id=task.id))
+
+@app.route('/capture/<task_id>/', methods=['GET', 'POST'])
+def capture_view(task_id):
+    task = get_task(task_id)
+    if task is None:
+        abort(404)
+
+    rpp = app.config['QUERY_ROWS_PER_PAGE']
+    page = request.values.get('page') or ''
+    page = max(int(page), 1) if page.isdigit() else 1
+    try:
+        ordering = int(request.values.get('ordering') or 0) or None
+    except ValueError:
+        ordering = None
+    if ordering and task.columns and abs(ordering) > len(task.columns):
+        ordering = None
+
+    result = total_pages = None
+    if task.status == 'done':
+        try:
+            columns, rows, has_next = task.store.read_page(
+                page, rpp, ordering)
+        except CaptureIncomplete:
+            flash('The captured result is no longer available.', 'warning')
+            return redirect(url_for('generic_query'))
+        result = Result('rows', columns=columns, rows=rows, has_next=has_next)
+        total_pages = max(1, int(math.ceil(task.row_count / float(rpp))))
+
+    return render_template(
+        'capture.html',
+        capture=task,
+        fk_lookup={},
+        ordering=ordering,
+        page=page,
+        page_start=(page - 1) * rpp + 1,
+        result=result,
+        total=task.row_count if task.status == 'done' else None,
+        total_pages=total_pages)
+
+@app.route('/capture/<task_id>/status.json')
+def capture_status(task_id):
+    task = get_task(task_id)
+    if task is None:
+        abort(404)
+    return jsonify(
+        id=task.id,
+        status=task.status,
+        row_count=task.row_count,
+        error=task.error)
+
+@app.route('/capture/<task_id>/cancel/', methods=['POST'])
+def capture_cancel(task_id):
+    task = get_task(task_id)
+    if task is None:
+        abort(404)
+    if task.status == 'running':
+        task.cancel()
+        flash('Capture is being cancelled.', 'info')
+    return redirect(url_for('capture_view', task_id=task.id))
+
+@app.route('/capture/<task_id>/delete/', methods=['POST'])
+def capture_delete(task_id):
+    task = remove_task(task_id)
+    if task is None:
+        abort(404)
+    task.close()
+    flash('Captured result deleted.', 'success')
+    return redirect(url_for('generic_query'))
+
+@app.route('/capture/<task_id>/export/<fmt>/')
+def capture_export(task_id, fmt):
+    task = get_task(task_id)
+    if task is None or fmt not in ('csv', 'json'):
+        abort(404)
+    streamer = None
+    if task.status == 'done':
+        try:
+            streamer = ExportStreamer(
+                task.store, fmt, app.config['BLOB_AS_BASE64'])
+        except CaptureIncomplete:
+            streamer = None
+    if streamer is None:
+        # A running, failed or cancelled capture is not a complete result
+        # and must not be downloadable as one.
+        flash('Only a completed capture can be exported.', 'warning')
+        return redirect(url_for('capture_view', task_id=task.id))
+
+    filename = 'capture-%s.%s' % (task.id, fmt)
+    mimetype = 'application/json' if fmt == 'json' else 'text/csv'
+    # ClosingIterator runs the cleanup even when the response is closed
+    # before the body is consumed (HEAD, client disconnect).
+    response = Response(ClosingIterator(streamer, streamer.close),
+                        mimetype=mimetype)
+    response.headers['Content-Disposition'] = 'attachment; filename="%s"' % (
+        filename)
+    response.headers['Expires'] = 0
+    response.headers['Pragma'] = 'public'
+    return response
+
+atexit.register(close_all_tasks)
+
 
 def export(query, export_format, table=None):
     dataset = get_dataset()

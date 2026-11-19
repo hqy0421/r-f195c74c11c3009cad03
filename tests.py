@@ -1,12 +1,15 @@
+import json
 import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 
 from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
+from sqlite_web import capture
 from sqlite_web import sqlite_web as sw
 from sqlite_web.executor import Result
 from sqlite_web.executor import is_read
@@ -988,6 +991,450 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+class TestCaptureStore(unittest.TestCase):
+    def setUp(self):
+        self.store = capture.CaptureStore()
+        self.addCleanup(self.store.destroy)
+
+    def begin_store(self, columns=('a', 'a', 'b', 'n')):
+        self.store.begin(columns, 'SELECT ...')
+        self.store.write_rows([
+            (1, 'x', b'\x01\x02', None),
+            (1.5, '', b'', None)])
+        self.store.finish(2)
+        self.store.close_writer()
+
+    def test_types_and_duplicate_columns_round_trip(self):
+        self.begin_store()
+        columns, rows, has_next = self.store.read_page(1, 10)
+        self.assertEqual(columns, ['a', 'a', 'b', 'n'])
+        self.assertEqual(rows, [
+            (1, 'x', b'\x01\x02', None),
+            (1.5, '', b'', None)])
+        self.assertFalse(has_next)
+        # Types really are the SQLite types, not text.
+        self.assertIsInstance(rows[0][0], int)
+        self.assertIsInstance(rows[1][0], float)
+        self.assertIsInstance(rows[0][2], bytes)
+
+    def test_pagination_and_ordering(self):
+        self.begin_store()
+        columns, rows, has_next = self.store.read_page(1, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(has_next)
+        columns, rows, has_next = self.store.read_page(2, 1)
+        self.assertEqual(rows, [(1.5, '', b'', None)])
+        self.assertFalse(has_next)
+        # Ordering is positional, so duplicate names are no problem.
+        columns, rows, has_next = self.store.read_page(1, 10, ordering=-1)
+        self.assertEqual(rows[0][0], 1.5)
+
+    def test_incomplete_store_is_not_readable(self):
+        self.store.begin(['a'], 'SELECT ...')
+        self.store.write_rows([(1,)])
+        self.store.close_writer()  # No finish(): no 'complete' marker.
+        self.assertRaises(capture.CaptureIncomplete, self.store.open_reader)
+        self.assertRaises(
+            capture.CaptureIncomplete, self.store.read_page, 1, 10)
+
+    def test_destroyed_store_is_not_readable(self):
+        self.begin_store()
+        self.store.destroy()
+        self.assertRaises(capture.CaptureIncomplete, self.store.open_reader)
+        self.store.destroy()  # Idempotent.
+
+    def test_export_csv(self):
+        self.begin_store()
+        text = ''.join(iter(capture.ExportStreamer(self.store, 'csv')))
+        self.assertEqual(text, 'a,a,b,n\r\n1,x,0102,\r\n1.5,,,\r\n')
+
+    def test_export_csv_base64(self):
+        self.begin_store()
+        streamer = capture.ExportStreamer(self.store, 'csv', True)
+        text = ''.join(iter(streamer))
+        self.assertEqual(text, 'a,a,b,n\r\n1,x,AQI=,\r\n1.5,,,\r\n')
+
+    def test_export_json_preserves_names_order_and_types(self):
+        self.begin_store()
+        payload = json.loads(
+            ''.join(iter(capture.ExportStreamer(self.store, 'json'))))
+        self.assertEqual(payload['columns'], ['a', 'a', 'b', 'n'])
+        self.assertEqual(payload['rows'],
+                         [[1, 'x', '0102', None], [1.5, '', '', None]])
+
+    def test_export_empty_result_has_headers(self):
+        self.store.begin(['id', 'name'], 'SELECT ...')
+        self.store.finish(0)
+        self.store.close_writer()
+        text = ''.join(iter(capture.ExportStreamer(self.store, 'csv')))
+        self.assertEqual(text, 'id,name\r\n')
+        payload = json.loads(
+            ''.join(iter(capture.ExportStreamer(self.store, 'json'))))
+        self.assertEqual(payload, {'columns': ['id', 'name'], 'rows': []})
+
+    def test_export_incomplete_store_raises(self):
+        self.store.begin(['a'], 'SELECT ...')
+        self.store.close_writer()
+        self.assertRaises(
+            capture.CaptureIncomplete,
+            capture.ExportStreamer, self.store, 'csv')
+
+    def test_streamer_close_without_iterating(self):
+        self.begin_store()
+        streamer = capture.ExportStreamer(self.store, 'csv')
+        streamer.close()  # HEAD-request path: no iteration, still released.
+        streamer.close()  # Idempotent.
+
+
+class TestCaptureTask(unittest.TestCase):
+    SLOW_SQL = ('WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 '
+                'FROM cnt LIMIT 10000000) SELECT sum(x) FROM cnt')
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, 't.db')
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE t (id INTEGER, v TEXT, b BLOB)')
+        conn.executemany(
+            'INSERT INTO t VALUES (?, ?, ?)',
+            [(1, 'one', b'\x01'), (2, 'two', None), (3, None, b'\xff')])
+        conn.commit()
+        conn.close()
+        self.tasks = []
+
+    def tearDown(self):
+        for task in self.tasks:
+            task.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make_task(self, sql):
+        task = capture.CaptureTask(
+            self.db_path, 't.db', sql, SqliteDatabase(self.db_path))
+        self.tasks.append(task)
+        task.start()
+        return task
+
+    def wait_task(self, task, timeout=10):
+        task._thread.join(timeout)
+        self.assertFalse(task._thread.is_alive())
+        return task
+
+    def test_success(self):
+        task = self.wait_task(self.make_task('SELECT * FROM t ORDER BY id'))
+        self.assertEqual(task.status, 'done')
+        self.assertEqual(task.row_count, 3)
+        self.assertEqual(task.columns, ['id', 'v', 'b'])
+        columns, rows, has_next = task.store.read_page(1, 10)
+        self.assertEqual(rows[0], (1, 'one', b'\x01'))
+        self.assertEqual(rows[2], (3, None, b'\xff'))
+        task.close()
+        self.assertFalse(os.path.exists(task.store.tmpdir))
+
+    def test_error_discards_result(self):
+        task = self.wait_task(self.make_task('SELECT * FROM missing'))
+        self.assertEqual(task.status, 'error')
+        self.assertIn('missing', task.error)
+        self.assertFalse(os.path.exists(task.store.tmpdir))
+
+    def test_cancel_discards_result(self):
+        task = self.make_task(self.SLOW_SQL)
+        task.cancel()
+        self.wait_task(task)
+        self.assertEqual(task.status, 'cancelled')
+        self.assertFalse(os.path.exists(task.store.tmpdir))
+
+    def test_empty_result(self):
+        task = self.wait_task(self.make_task('SELECT id, v FROM t WHERE 0'))
+        self.assertEqual(task.status, 'done')
+        self.assertEqual(task.row_count, 0)
+        columns, rows, has_next = task.store.read_page(1, 10)
+        self.assertEqual(columns, ['id', 'v'])
+        self.assertEqual(rows, [])
+
+
+class TestCapture(BaseAppTestCase):
+    SLOW_SQL = TestCaptureTask.SLOW_SQL
+
+    def tearDown(self):
+        capture.close_all_tasks()
+        super().tearDown()
+
+    def start_capture(self, sql, **data):
+        data.setdefault('sql', sql)
+        r = self.client.post('/capture/', data=data)
+        self.assertIn(r.status_code, (302, 303))
+        location = r.headers['Location']
+        self.assertIn('/capture/', location)
+        return location.rstrip('/').rsplit('/', 1)[-1]
+
+    def wait_capture(self, task_id, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r = self.client.get('/capture/%s/status.json' % task_id)
+            self.assertEqual(r.status_code, 200)
+            data = json.loads(r.data)
+            if data['status'] != 'running':
+                return data
+            time.sleep(0.05)
+        self.fail('capture %s did not finish' % task_id)
+
+    def capture_count(self):
+        return len(capture.tasks_for_dataset(os.path.realpath(self.db_path)))
+
+    def test_capture_button_on_query_pages(self):
+        for url in ('/query/', '/users/query/'):
+            r = self.client.get(url)
+            self.assertIn(b'formaction="/capture/"', r.data)
+
+    def test_capture_and_browse(self):
+        task_id = self.start_capture('SELECT * FROM users')
+        data = self.wait_capture(task_id)
+        self.assertEqual(data['status'], 'done')
+        self.assertEqual(data['row_count'], 3)
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertIn(b'Capture complete', r.data)
+        self.assertIn(b'huey', r.data)
+        # The capture is listed on the query page of its database.
+        r = self.client.get('/query/')
+        self.assertIn(('/capture/%s/' % task_id).encode(), r.data)
+
+    def test_capture_immune_to_source_edits(self):
+        task_id = self.start_capture('SELECT * FROM users ORDER BY id')
+        self.wait_capture(task_id)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('DELETE FROM users')
+        conn.execute("INSERT INTO users (username) VALUES ('post-capture')")
+        conn.commit()
+        conn.close()
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertIn(b'huey', r.data)
+        self.assertNotIn(b'post-capture', r.data)
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertIn(b'huey', r.data)
+        self.assertNotIn(b'post-capture', r.data)
+
+    def test_capture_preserves_duplicate_columns_and_types(self):
+        task_id = self.start_capture(
+            "SELECT 1 AS x, 'a' AS x, x'0102' AS b, NULL AS n")
+        self.wait_capture(task_id)
+        r = self.client.get('/capture/%s/export/json/' % task_id)
+        payload = json.loads(r.data)
+        self.assertEqual(payload['columns'], ['x', 'x', 'b', 'n'])
+        self.assertEqual(payload['rows'], [[1, 'a', '0102', None]])
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertEqual(r.data, b'x,x,b,n\r\n1,a,0102,\r\n')
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertEqual(r.data.count(b'data-col="x"'), 2)
+
+    def test_capture_empty_result_has_headers(self):
+        task_id = self.start_capture('SELECT id, username FROM users WHERE 0')
+        data = self.wait_capture(task_id)
+        self.assertEqual(data['status'], 'done')
+        self.assertEqual(data['row_count'], 0)
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertEqual(r.data, b'id,username\r\n')
+        r = self.client.get('/capture/%s/export/json/' % task_id)
+        self.assertEqual(json.loads(r.data),
+                         {'columns': ['id', 'username'], 'rows': []})
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertIn(b'Empty result set', r.data)
+
+    def test_capture_rejects_writes_and_scripts(self):
+        for sql in ('DELETE FROM users',
+                    "INSERT INTO users (username) VALUES ('x')",
+                    'SELECT 1; SELECT 2',
+                    ''):
+            r = self.client.post('/capture/', data={'sql': sql})
+            self.assertIn(r.status_code, (302, 303), sql)
+            self.assertNotIn('/capture/', r.headers['Location'], sql)
+        self.assertEqual(self.capture_count(), 0)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_capture_reject_returns_to_table_query(self):
+        r = self.client.post('/capture/', data={
+            'sql': 'DELETE FROM users', 'table': 'users'})
+        self.assertIn('/users/query/', r.headers['Location'])
+
+    def test_capture_cancel(self):
+        task_id = self.start_capture(self.SLOW_SQL)
+        r = self.client.post('/capture/%s/cancel/' % task_id)
+        self.assertIn(r.status_code, (302, 303))
+        data = self.wait_capture(task_id)
+        self.assertEqual(data['status'], 'cancelled')
+        # A cancelled capture is not downloadable as a complete result.
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertIn(r.status_code, (302, 303))
+        self.assertNotIn('attachment',
+                         r.headers.get('Content-Disposition', ''))
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertIn(b'cancelled', r.data)
+
+    def test_running_capture_is_not_exportable(self):
+        task_id = self.start_capture(self.SLOW_SQL)
+        try:
+            r = self.client.get('/capture/%s/export/json/' % task_id)
+            self.assertIn(r.status_code, (302, 303))
+            self.assertNotIn('attachment',
+                             r.headers.get('Content-Disposition', ''))
+        finally:
+            capture.get_task(task_id).cancel()
+            self.wait_capture(task_id)
+
+    def test_failed_capture_is_not_exportable(self):
+        # Passes the is_read probe, then the table vanishes before the
+        # capture task runs its own connection.
+        self.client.post('/query/', data={'sql': 'CREATE TABLE doomed (id INTEGER)'})
+        task_id = self.start_capture('SELECT * FROM doomed')
+        self.client.post('/query/', data={'sql': 'DROP TABLE doomed'})
+        data = self.wait_capture(task_id)
+        if data['status'] == 'error':
+            r = self.client.get('/capture/%s/export/csv/' % task_id)
+            self.assertIn(r.status_code, (302, 303))
+        else:
+            # The capture won the race and finished before the DROP:
+            # that is a complete result and may be exported.
+            self.assertEqual(data['status'], 'done')
+
+    def test_capture_delete_releases_result(self):
+        marker = os.path.join(self.tmp, 'capture-tmp')
+        os.mkdir(marker)
+        orig = capture.tempfile.mkdtemp
+        capture.tempfile.mkdtemp = lambda **kw: marker
+        try:
+            task_id = self.start_capture('SELECT * FROM users')
+            self.wait_capture(task_id)
+            self.assertTrue(os.path.exists(os.path.join(marker, 'result.db')))
+            r = self.client.post('/capture/%s/delete/' % task_id)
+            self.assertIn(r.status_code, (302, 303))
+            self.assertFalse(os.path.exists(marker))
+        finally:
+            capture.tempfile.mkdtemp = orig
+        self.assertEqual(self.client.get('/capture/%s/' % task_id).status_code,
+                         404)
+        self.assertEqual(
+            self.client.get('/capture/%s/status.json' % task_id).status_code,
+            404)
+
+    def test_capture_pagination_and_ordering(self):
+        sw.app.config['QUERY_ROWS_PER_PAGE'] = 2
+        try:
+            task_id = self.start_capture('SELECT * FROM users')
+            self.wait_capture(task_id)
+            r = self.client.get('/capture/%s/' % task_id)
+            self.assertIn(b'huey', r.data)
+            self.assertIn(b'mickey', r.data)
+            self.assertNotIn(b'zaizee', r.data)
+            r = self.client.get('/capture/%s/?page=2' % task_id)
+            self.assertIn(b'zaizee', r.data)
+            # Ordering reads the stored snapshot, not the source table.
+            r = self.client.get('/capture/%s/?ordering=-2' % task_id)
+            self.assertLess(r.data.index(b'zaizee'), r.data.index(b'mickey'))
+        finally:
+            sw.app.config['QUERY_ROWS_PER_PAGE'] = 1000
+
+    def test_export_response_headers(self):
+        task_id = self.start_capture('SELECT * FROM users')
+        self.wait_capture(task_id)
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertIn('attachment', r.headers['Content-Disposition'])
+        self.assertIn('capture-%s.csv' % task_id,
+                      r.headers['Content-Disposition'])
+        self.assertIn('text/csv', r.headers['Content-Type'])
+        r = self.client.get('/capture/%s/export/json/' % task_id)
+        self.assertIn('capture-%s.json' % task_id,
+                      r.headers['Content-Disposition'])
+        self.assertIn('application/json', r.headers['Content-Type'])
+
+    def test_unknown_capture_404s(self):
+        self.assertEqual(self.client.get('/capture/nope/').status_code, 404)
+        self.assertEqual(
+            self.client.get('/capture/nope/status.json').status_code, 404)
+        self.assertEqual(
+            self.client.get('/capture/nope/export/csv/').status_code, 404)
+        self.assertEqual(
+            self.client.post('/capture/nope/cancel/').status_code, 404)
+        self.assertEqual(
+            self.client.post('/capture/nope/delete/').status_code, 404)
+
+
+class TestCaptureMultiDb(BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.db2 = os.path.join(self.tmp, 'two.db')
+        conn = sqlite3.connect(self.db2)
+        conn.execute('CREATE TABLE t2 (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        conn.close()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path, self.db2])
+        sw.app.config['ENABLE_FILESYSTEM'] = True
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        capture.close_all_tasks()
+        sw.app.config['ENABLE_FILESYSTEM'] = False
+        super().tearDown()
+
+    def select(self, path):
+        return self.client.get('/select-dataset/',
+                               query_string={'name': os.path.realpath(path)})
+
+    def start_capture(self, sql):
+        r = self.client.post('/capture/', data={'sql': sql})
+        self.assertIn(r.status_code, (302, 303))
+        return r.headers['Location'].rstrip('/').rsplit('/', 1)[-1]
+
+    def wait_capture(self, task_id, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = json.loads(
+                self.client.get('/capture/%s/status.json' % task_id).data)
+            if data['status'] != 'running':
+                return data
+            time.sleep(0.05)
+        self.fail('capture %s did not finish' % task_id)
+
+    def test_capture_list_is_scoped_to_current_dataset(self):
+        task_id = self.start_capture('SELECT * FROM users')
+        self.wait_capture(task_id)
+        r = self.client.get('/query/')
+        self.assertIn(('/capture/%s/' % task_id).encode(), r.data)
+        # Switching databases hides the other database's captures...
+        self.select(self.db2)
+        r = self.client.get('/query/')
+        self.assertNotIn(('/capture/%s/' % task_id).encode(), r.data)
+        # ...but the capture itself still serves its own database's data.
+        r = self.client.get('/capture/%s/' % task_id)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'huey', r.data)
+        self.assertIn(b'app.db', r.data)
+        r = self.client.get('/capture/%s/export/csv/' % task_id)
+        self.assertIn(b'huey', r.data)
+
+    def test_unload_closes_its_captures(self):
+        task_id = self.start_capture('SELECT * FROM users')
+        self.wait_capture(task_id)
+        store_dir = capture.get_task(task_id).store.tmpdir
+        self.assertTrue(os.path.exists(store_dir))
+        r = self.client.post(
+            '/unload/', data={'dataset': os.path.realpath(self.db_path)})
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.client.get('/capture/%s/' % task_id).status_code,
+                         404)
+        self.assertFalse(os.path.exists(store_dir))
+        self.assertEqual(list(sw.datasets), [os.path.realpath(self.db2)])
+
+    def test_unload_cancels_running_capture(self):
+        task_id = self.start_capture(TestCaptureTask.SLOW_SQL)
+        r = self.client.post(
+            '/unload/', data={'dataset': os.path.realpath(self.db_path)})
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(
+            self.client.get('/capture/%s/status.json' % task_id).status_code,
+            404)
+        self.assertEqual(list(sw.datasets), [os.path.realpath(self.db2)])
 
 
 if __name__ == '__main__':

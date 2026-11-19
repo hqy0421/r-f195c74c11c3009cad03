@@ -1,0 +1,21 @@
+{% if captures %}
+  <div class="captures mt-2">
+    <h4>Captured results</h4>
+    <ul class="list-unstyled">
+      {% for c in captures %}
+        <li>
+          <a href="{{ url_for('capture_view', task_id=c.id) }}"><code>{{ c.sql|truncate(80, True) }}</code></a>
+          {% if c.status == 'running' %}
+            <span class="badge badge-info">running &mdash; {{ c.row_count }} row(s) so far</span>
+          {% elif c.status == 'done' %}
+            <span class="badge badge-success">complete &mdash; {{ c.row_count }} row(s)</span>
+          {% elif c.status == 'error' %}
+            <span class="badge badge-danger">failed</span>
+          {% else %}
+            <span class="badge badge-warning">cancelled</span>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+{% endif %}
